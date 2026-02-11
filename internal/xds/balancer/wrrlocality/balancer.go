@@ -26,9 +26,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/weightedtarget"
+	estats "google.golang.org/grpc/experimental/stats"
 	"google.golang.org/grpc/internal/grpclog"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	xdsinternal "google.golang.org/grpc/internal/xds"
@@ -38,6 +40,16 @@ import (
 
 // Name is the name of wrr_locality balancer.
 const Name = "xds_wrr_locality_experimental"
+
+var (
+	localityUpdatesMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.wrr_locality.locality_updates",
+		Description: "EXPERIMENTAL. Number of times the set of localities has changed.",
+		Unit:        "{update}",
+		Labels:      []string{"grpc.target"},
+		Default:     false,
+	})
+)
 
 func init() {
 	balancer.Register(bb{})
@@ -80,8 +92,10 @@ func (bb) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Ba
 		return nil
 	}
 	wrrL := &wrrLocalityBalancer{
-		child:       wtb,
-		childParser: wtbCfgParser,
+		child:           wtb,
+		childParser:     wtbCfgParser,
+		target:          bOpts.Target.String(),
+		metricsRecorder: cc.MetricsRecorder(),
 	}
 
 	wrrL.logger = prefixLogger(wrrL)
@@ -152,6 +166,10 @@ type wrrLocalityBalancer struct {
 	childParser balancer.ConfigParser
 
 	logger *grpclog.PrefixLogger
+
+	target             string
+	metricsRecorder    estats.MetricsRecorder
+	previousLocalities map[string]bool
 }
 
 func (b *wrrLocalityBalancer) ExitIdle() {
@@ -178,6 +196,36 @@ func (b *wrrLocalityBalancer) UpdateClientConnState(s balancer.ClientConnState) 
 		}
 		weightedTargets[locality] = weightedtarget.Target{Weight: ai.LocalityWeight, ChildPolicy: lbCfg.ChildPolicy}
 	}
+
+	// Compare with previous
+	currentLocalities := make(map[string]bool)
+	for k := range weightedTargets {
+		currentLocalities[k] = true
+	}
+
+	changed := false
+	if len(currentLocalities) != len(b.previousLocalities) {
+		changed = true
+	} else {
+		for k := range currentLocalities {
+			if !b.previousLocalities[k] {
+				changed = true
+				break
+			}
+		}
+	}
+
+	if changed {
+		localityUpdatesMetric.Record(b.metricsRecorder, 1, b.target)
+		keys := make([]string, 0, len(currentLocalities))
+		for k := range currentLocalities {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf("wrrlocality: localities CHANGED: %v\n", keys)
+		b.previousLocalities = currentLocalities
+	}
+
 	wtCfg := &weightedtarget.LBConfig{Targets: weightedTargets}
 	wtCfgJSON, err := json.Marshal(wtCfg)
 	if err != nil {

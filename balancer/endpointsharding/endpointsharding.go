@@ -34,10 +34,57 @@ import (
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/connectivity"
+	estats "google.golang.org/grpc/experimental/stats"
+	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/resolver"
 )
 
-var randIntN = rand.IntN
+var (
+	logger   = grpclog.Component("endpointsharding")
+	randIntN = rand.IntN
+
+	childrenCreatedMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.endpointsharding.children_created",
+		Description: "EXPERIMENTAL. Number of child balancers created by endpointsharding.",
+		Unit:        "{child}",
+		Default:     false,
+	})
+
+	childrenRemovedMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.endpointsharding.children_removed",
+		Description: "EXPERIMENTAL. Number of child balancers removed by endpointsharding.",
+		Unit:        "{child}",
+		Default:     false,
+	})
+
+	endpointUpdatesMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.endpointsharding.endpoint_updates",
+		Description: "EXPERIMENTAL. Number of UpdateClientConnState calls to endpointsharding.",
+		Unit:        "{update}",
+		Default:     false,
+	})
+
+	childrenClosedMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.endpointsharding.children_closed",
+		Description: "EXPERIMENTAL. Number of child balancers closed by endpointsharding (includes both removals and full balancer close).",
+		Unit:        "{child}",
+		Default:     false,
+	})
+
+	balancerClosedMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.endpointsharding.balancer_closed",
+		Description: "EXPERIMENTAL. Number of times the endpointsharding balancer is fully closed.",
+		Unit:        "{close}",
+		Default:     false,
+	})
+
+	exitIdleLaunchesMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:        "grpc.lb.endpointsharding.exit_idle_launches",
+		Description: "EXPERIMENTAL. Number of ExitIdle goroutines launched by endpointsharding.",
+		Unit:        "{launch}",
+		Default:     false,
+	})
+)
 
 // ChildState is the balancer state of a child along with the endpoint which
 // identifies the child balancer.
@@ -146,9 +193,17 @@ func (es *endpointSharding) UpdateClientConnState(state balancer.ClientConnState
 	}()
 	var ret error
 
+	endpointUpdatesMetric.Record(es.cc.MetricsRecorder(), 1)
+
 	children := es.children.Load()
 	newChildren := resolver.NewEndpointMap[*balancerWrapper]()
 
+	addrs := make([]string, len(state.ResolverState.Endpoints))
+	for i, endpoint := range state.ResolverState.Endpoints {
+		if len(endpoint.Addresses) > 0 {
+			addrs[i] = endpoint.Addresses[0].Addr
+		}
+	}
 	// Update/Create new children.
 	for _, endpoint := range rotateEndpoints(state.ResolverState.Endpoints) {
 		if _, ok := newChildren.Get(endpoint); ok {
@@ -169,6 +224,7 @@ func (es *endpointSharding) UpdateClientConnState(state balancer.ClientConnState
 				es:         es,
 			}
 			childBalancer.childState.Balancer = childBalancer
+			childrenCreatedMetric.Record(es.cc.MetricsRecorder(), 1)
 			childBalancer.child = es.childBuilder(childBalancer, es.bOpts)
 		}
 		newChildren.Set(endpoint, childBalancer)
@@ -190,6 +246,7 @@ func (es *endpointSharding) UpdateClientConnState(state balancer.ClientConnState
 	for _, e := range children.Keys() {
 		child, _ := children.Get(e)
 		if _, ok := newChildren.Get(e); !ok {
+			childrenRemovedMetric.Record(es.cc.MetricsRecorder(), 1)
 			child.closeLocked()
 		}
 	}
@@ -224,6 +281,7 @@ func (es *endpointSharding) UpdateSubConnState(balancer.SubConn, balancer.SubCon
 func (es *endpointSharding) Close() {
 	es.childMu.Lock()
 	defer es.childMu.Unlock()
+	balancerClosedMetric.Record(es.cc.MetricsRecorder(), 1)
 	children := es.children.Load()
 	for _, child := range children.Values() {
 		child.closeLocked()
@@ -362,6 +420,7 @@ func (bw *balancerWrapper) UpdateState(state balancer.State) {
 // avoid deadlocks due to synchronous balancer state updates.
 func (bw *balancerWrapper) ExitIdle() {
 	go func() {
+		exitIdleLaunchesMetric.Record(bw.es.cc.MetricsRecorder(), 1)
 		bw.es.childMu.Lock()
 		if !bw.isClosed {
 			bw.child.ExitIdle()
@@ -380,6 +439,7 @@ func (bw *balancerWrapper) updateClientConnStateLocked(ccs balancer.ClientConnSt
 // closeLocked closes the child balancer. Callers must hold the child mutext of
 // the parent endpointsharding balancer.
 func (bw *balancerWrapper) closeLocked() {
+	childrenClosedMetric.Record(bw.es.cc.MetricsRecorder(), 1)
 	bw.child.Close()
 	bw.isClosed = true
 }

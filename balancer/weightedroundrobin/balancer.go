@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"fmt"
 	rand "math/rand/v2"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,6 +92,69 @@ var (
 		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
 		Default:        false,
 	})
+
+	schedulerLaunchesMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.scheduler_launches",
+		Description:    "EXPERIMENTAL. Number of times the WRR scheduler background goroutine is started.",
+		Unit:           "{launch}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
+
+	schedulerStopsMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.scheduler_stops",
+		Description:    "EXPERIMENTAL. Number of times the WRR scheduler background goroutine is stopped.",
+		Unit:           "{stop}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
+
+	picksMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.picks",
+		Description:    "EXPERIMENTAL. Number of times the WRR picker is picked.",
+		Unit:           "{pick}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
+
+	pickDoneMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.pick_done",
+		Description:    "EXPERIMENTAL. Number of times the WRR pick is done.",
+		Unit:           "{done}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
+
+	endpointsAddedMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.endpoints_added",
+		Description:    "EXPERIMENTAL. Number of new endpoints added during updateEndpointsLocked.",
+		Unit:           "{endpoint}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
+
+	endpointsRemovedMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.endpoints_removed",
+		Description:    "EXPERIMENTAL. Number of endpoints removed during updateEndpointsLocked.",
+		Unit:           "{endpoint}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
+
+	endpointUpdatesMetric = estats.RegisterInt64Count(estats.MetricDescriptor{
+		Name:           "grpc.lb.wrr.endpoint_updates",
+		Description:    "EXPERIMENTAL. Number of times UpdateClientConnState is called on the WRR balancer.",
+		Unit:           "{update}",
+		Labels:         []string{"grpc.target"},
+		OptionalLabels: []string{"grpc.lb.locality", "grpc.lb.backend_service"},
+		Default:        false,
+	})
 )
 
 func init() {
@@ -112,6 +176,8 @@ func (bb) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Ba
 	b.child = endpointsharding.NewBalancer(b, bOpts, balancer.Get(pickfirst.Name).Build, endpointsharding.Options{})
 	b.logger = prefixLogger(b)
 	b.logger.Infof("Created")
+	fmt.Println("WRR Balancer Created")
+	debug.PrintStack()
 	return b
 }
 
@@ -157,6 +223,7 @@ func (bb) Name() string {
 func (b *wrrBalancer) updateEndpointsLocked(endpoints []resolver.Endpoint) {
 	endpointSet := resolver.NewEndpointMap[*endpointWeight]()
 	addressSet := resolver.NewAddressMapV2[*endpointWeight]()
+	var added int64
 	for _, endpoint := range endpoints {
 		endpointSet.Set(endpoint, nil)
 		for _, addr := range endpoint.Addresses {
@@ -164,6 +231,7 @@ func (b *wrrBalancer) updateEndpointsLocked(endpoints []resolver.Endpoint) {
 		}
 		ew, ok := b.endpointToWeight.Get(endpoint)
 		if !ok {
+			added++
 			ew = &endpointWeight{
 				logger:            b.logger,
 				connectivityState: connectivity.Connecting,
@@ -183,11 +251,13 @@ func (b *wrrBalancer) updateEndpointsLocked(endpoints []resolver.Endpoint) {
 		ew.updateConfig(b.cfg)
 	}
 
+	var removed int64
 	for _, endpoint := range b.endpointToWeight.Keys() {
 		if _, ok := endpointSet.Get(endpoint); ok {
 			// Existing endpoint also in new endpoint list; skip.
 			continue
 		}
+		removed++
 		b.endpointToWeight.Delete(endpoint)
 		for _, addr := range endpoint.Addresses {
 			if _, ok := addressSet.Get(addr); !ok { // old endpoints to be deleted can share addresses with new endpoints, so only delete if necessary
@@ -196,6 +266,12 @@ func (b *wrrBalancer) updateEndpointsLocked(endpoints []resolver.Endpoint) {
 		}
 		// SubConn map will get handled in updateSubConnState
 		// when receives SHUTDOWN signal.
+	}
+	if added > 0 {
+		endpointsAddedMetric.Record(b.metricsRecorder, added, b.target, b.locality, b.clusterName)
+	}
+	if removed > 0 {
+		endpointsRemovedMetric.Record(b.metricsRecorder, removed, b.target, b.locality, b.clusterName)
 	}
 }
 
@@ -217,6 +293,7 @@ type wrrBalancer struct {
 	addressWeights   *resolver.AddressMapV2[*endpointWeight]
 	endpointToWeight *resolver.EndpointMap[*endpointWeight]
 	scToWeight       map[balancer.SubConn]*endpointWeight
+	closed           bool
 }
 
 func (b *wrrBalancer) UpdateClientConnState(ccs balancer.ClientConnState) error {
@@ -234,6 +311,7 @@ func (b *wrrBalancer) UpdateClientConnState(ccs balancer.ClientConnState) error 
 	b.cfg = cfg
 	b.locality = weightedtarget.LocalityFromResolverState(ccs.ResolverState)
 	b.clusterName = backendServiceFromState(ccs.ResolverState)
+	endpointUpdatesMetric.Record(b.metricsRecorder, 1, b.target, b.locality, b.clusterName)
 	b.updateEndpointsLocked(ccs.ResolverState.Endpoints)
 	b.mu.Unlock()
 
@@ -392,6 +470,7 @@ func (b *wrrBalancer) updateSubConnState(sc balancer.SubConn, state balancer.Sub
 // stops any ORCA listeners.
 func (b *wrrBalancer) Close() {
 	b.mu.Lock()
+	b.closed = true
 	if b.stopPicker != nil {
 		b.stopPicker.Fire()
 		b.stopPicker = nil
@@ -405,6 +484,8 @@ func (b *wrrBalancer) Close() {
 		}
 	}
 	b.child.Close()
+	fmt.Println("WRR Balancer Closing")
+	debug.PrintStack()
 }
 
 func (b *wrrBalancer) ExitIdle() {
@@ -438,6 +519,7 @@ func (p *picker) endpointWeights(recordMetrics bool) []float64 {
 }
 
 func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+	picksMetric.Record(p.metricsRecorder, 1, p.target, p.locality, p.clusterName)
 	// Read the scheduler atomically.  All scheduler operations are threadsafe,
 	// and if the scheduler is replaced during this usage, we want to use the
 	// scheduler that was live when the pick started.
@@ -449,17 +531,27 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 		logger.Errorf("ready picker returned error: %v", err)
 		return balancer.PickResult{}, err
 	}
-	if !p.cfg.EnableOOBLoadReport {
-		oldDone := pr.Done
-		pr.Done = func(info balancer.DoneInfo) {
+
+	// Always wrap Done to record metric, unless we can hook into existing wrap.
+	// The existing logic wraps Done ONLY if EnableOOBLoadReport is FALSE.
+	// We should probably always wrap it if we want to count it.
+	// But that allocates a closure.
+
+	oldDone := pr.Done
+	pr.Done = func(info balancer.DoneInfo) {
+		pickDoneMetric.Record(p.metricsRecorder, 1, p.target, p.locality, p.clusterName)
+
+		// Original logic for OOB load report
+		if !p.cfg.EnableOOBLoadReport {
 			if load, ok := info.ServerLoad.(*v3orcapb.OrcaLoadReport); ok && load != nil {
 				pickedPicker.weightedEndpoint.OnLoadReport(load)
 			}
-			if oldDone != nil {
-				oldDone(info)
-			}
+		}
+		if oldDone != nil {
+			oldDone(info)
 		}
 	}
+
 	return pr, nil
 }
 
@@ -474,10 +566,12 @@ func (p *picker) regenerateScheduler() {
 
 func (p *picker) start(stopPicker *grpcsync.Event) {
 	p.regenerateScheduler()
-	if len(p.weightedPickers) == 1 {
+	if len(p.weightedPickers) <= 1 {
 		// No need to regenerate weights with only one backend.
 		return
 	}
+
+	schedulerLaunchesMetric.Record(p.metricsRecorder, 1, p.target, p.locality, p.clusterName)
 
 	go func() {
 		ticker := time.NewTicker(time.Duration(p.cfg.WeightUpdatePeriod))
@@ -485,6 +579,7 @@ func (p *picker) start(stopPicker *grpcsync.Event) {
 		for {
 			select {
 			case <-stopPicker.Done():
+				schedulerStopsMetric.Record(p.metricsRecorder, 1, p.target, p.locality, p.clusterName)
 				return
 			case <-ticker.C:
 				p.regenerateScheduler()
